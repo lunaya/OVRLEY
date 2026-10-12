@@ -280,6 +280,11 @@ impl PlannedVideoRender {
             VideoRenderModePlan::Composite { render: plan, .. } => &plan.coverage,
             VideoRenderModePlan::Transparent(plan) => &plan.coverage,
         };
+        // A permitted disjoint window or absent embedded telemetry has no
+        // activity samples. Static rasters are rendered by the padding layer.
+        if coverage.frame_count == 0 && coverage.end <= coverage.start {
+            return Ok(DenseActivityReport::default());
+        }
         build_dense_activity_report_for_timeline(
             activity,
             &self.config,
@@ -347,7 +352,8 @@ pub(crate) fn plan_batch_item(
     source: &InspectedVideoSource,
     offset: f64,
     skip_overlay: bool,
-    activity_end: f64,
+    activity_end: Option<f64>,
+    auto_sync: bool,
     output_frame_count: u32,
     container_fps: Fps,
 ) -> CoreResult<PlannedVideoRender> {
@@ -359,13 +365,18 @@ pub(crate) fn plan_batch_item(
         CodecSelection::Transparent(_) => encoding.layout_fps,
     };
     let layout_frame_count = sampling_fps.frame_count_for_duration(duration)?;
-    let coverage = ActivityCoverage::for_video(
-        duration,
-        offset,
-        activity_end,
-        sampling_fps,
-        layout_frame_count,
-    )?;
+    let coverage = match activity_end {
+        Some(end) if auto_sync => {
+            ActivityCoverage::for_video(duration, offset, end, sampling_fps, layout_frame_count)?
+        }
+        end => ActivityCoverage::for_video_or_blank(
+            duration,
+            offset,
+            end.unwrap_or(0.0),
+            sampling_fps,
+            layout_frame_count,
+        )?,
+    };
     let mut presentation = template.config.scene.clone();
     presentation.width = source.display_resolution.width as u32;
     presentation.height = source.display_resolution.height as u32;
@@ -383,7 +394,7 @@ pub(crate) fn plan_batch_item(
         custom_export_range_active: Some(true),
     };
     let mut config = template.config.clone().with_scene(scene);
-    if skip_overlay {
+    if skip_overlay || coverage.end <= coverage.start {
         config.backdrops.clear();
         config.labels.clear();
         config.values.clear();
