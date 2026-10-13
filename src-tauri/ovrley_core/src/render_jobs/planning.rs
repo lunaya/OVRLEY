@@ -410,6 +410,7 @@ pub(crate) fn plan_batch_item(
             },
             source_metadata: Some(CompositeSourceMetadata {
                 has_audio: source.metadata.has_audio,
+                audio_bit_rate: source.metadata.audio_bit_rate,
                 rotation_degrees: source.metadata.rotation_degrees,
             }),
         },
