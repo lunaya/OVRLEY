@@ -15,36 +15,38 @@ use std::time::{Duration, Instant};
 
 const CODEC_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
+struct QsvProbeCandidate {
+    init_args: &'static [&'static str],
+    main_preparation: &'static str,
+}
+
 /// Returns the first QSV device arguments that can scale, composite, and encode.
 ///
-/// Windows tries explicit D3D11VA-derived QSV before DXVA2. The live composite
-/// encoder reuses the successful arguments, including the selected backend.
+/// Keeps 2.49.2's automatic QSV selection (D3D11 with the bundled oneVPL build)
+/// and NV12 upload first. Windows then tries DXVA2 with a fixed BGRA upload.
+/// The live composite encoder reuses only the successful device arguments.
 pub(super) fn detect_qsv_full_init_args(ffmpeg_path: &Path) -> Option<Vec<String>> {
-    select_qsv_full_init_args(|args| probe_qsv_overlay_path(ffmpeg_path, args))
+    select_qsv_full_init_args(|candidate| probe_qsv_overlay_path(ffmpeg_path, candidate))
 }
 
-fn select_qsv_full_init_args(mut probe: impl FnMut(&[String]) -> bool) -> Option<Vec<String>> {
-    qsv_full_init_arg_candidates()
+fn select_qsv_full_init_args(
+    mut probe: impl FnMut(&QsvProbeCandidate) -> bool,
+) -> Option<Vec<String>> {
+    qsv_full_probe_candidates()
         .into_iter()
-        .find(|args| probe(args))
+        .find(|candidate| probe(candidate))
+        .map(|candidate| {
+            candidate
+                .init_args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect()
+        })
 }
 
-fn qsv_full_init_arg_candidates() -> Vec<Vec<String>> {
-    let mut candidates = if cfg!(windows) {
-        vec![vec![
-            "-init_hw_device",
-            "d3d11va=dx",
-            "-init_hw_device",
-            "qsv=qs@dx",
-            "-filter_hw_device",
-            "qs",
-            "-hwaccel",
-            "qsv",
-            "-hwaccel_output_format",
-            "qsv",
-        ]]
-    } else {
-        vec![vec![
+fn qsv_full_probe_candidates() -> Vec<QsvProbeCandidate> {
+    let mut candidates = vec![QsvProbeCandidate {
+        init_args: &[
             "-init_hw_device",
             "qsv=qs",
             "-filter_hw_device",
@@ -53,50 +55,46 @@ fn qsv_full_init_arg_candidates() -> Vec<Vec<String>> {
             "qsv",
             "-hwaccel_output_format",
             "qsv",
-        ]]
-    };
+        ],
+        main_preparation: "format=nv12,hwupload",
+    }];
     if cfg!(windows) {
-        candidates.push(vec![
-            "-init_hw_device",
-            "dxva2=dx",
-            "-init_hw_device",
-            "qsv=qs@dx",
-            "-filter_hw_device",
-            "qs",
-            "-hwaccel",
-            "qsv",
-            "-hwaccel_output_format",
-            "qsv",
-        ]);
+        candidates.push(QsvProbeCandidate {
+            init_args: &[
+                "-init_hw_device",
+                "dxva2=dx",
+                "-init_hw_device",
+                "qsv=qs@dx",
+                "-filter_hw_device",
+                "qs",
+                "-hwaccel",
+                "qsv",
+                "-hwaccel_output_format",
+                "qsv",
+            ],
+            main_preparation: "format=bgra,hwupload=extra_hw_frames=16,scale_qsv=format=nv12",
+        });
     }
 
     candidates
-        .into_iter()
-        .map(|args| args.into_iter().map(str::to_string).collect())
-        .collect()
 }
 
 /// Probes whether a QSV device can run the performance QSV filter path.
 ///
 /// Prepares synthetic NV12 hardware frames, then exercises the live render
 /// graph and direct hardware-frame encoding for 30 frames without video decode.
-/// Windows prepares NV12 through a BGRA upload and GPU conversion: DXVA2 needs
-/// a fixed upload pool, while fixed NV12 uploads can fail on D3D11. The live
-/// render graph owns the overlay upload's 16-frame pool on both backends.
-fn probe_qsv_overlay_path(ffmpeg_path: &Path, init_args: &[String]) -> bool {
+/// Main-frame preparation belongs to each candidate: the preferred path uploads
+/// NV12 directly, while DXVA2 uses a fixed BGRA upload and GPU conversion.
+/// The live render graph owns the overlay upload's 16-frame pool on both paths.
+fn probe_qsv_overlay_path(ffmpeg_path: &Path, candidate: &QsvProbeCandidate) -> bool {
     probe_codec(
         "qsv_overlay",
         ffmpeg_path,
-        &qsv_overlay_probe_args(init_args),
+        &qsv_overlay_probe_args(candidate),
     )
 }
 
-fn qsv_overlay_probe_args(init_args: &[String]) -> Vec<String> {
-    let main_preparation = if cfg!(windows) {
-        "format=bgra,hwupload=extra_hw_frames=16,scale_qsv=format=nv12"
-    } else {
-        "format=nv12,hwupload"
-    };
+fn qsv_overlay_probe_args(candidate: &QsvProbeCandidate) -> Vec<String> {
     let render_graph = composite_filter_complex(
         128,
         128,
@@ -109,7 +107,8 @@ fn qsv_overlay_probe_args(init_args: &[String]) -> Vec<String> {
     )
     .expect("fixed QSV probe dimensions and timing produce a valid render graph");
     let filter_complex = format!(
-        "[0:v]{main_preparation}[probe_main];{}",
+        "[0:v]{}[probe_main];{}",
+        candidate.main_preparation,
         render_graph.replacen("[0:v]", "[probe_main]", 1),
     );
     let mut args = vec![
@@ -117,7 +116,7 @@ fn qsv_overlay_probe_args(init_args: &[String]) -> Vec<String> {
         "-loglevel".to_string(),
         "error".to_string(),
     ];
-    args.extend(init_args.iter().cloned());
+    args.extend(candidate.init_args.iter().map(|arg| (*arg).to_string()));
     args.extend([
         "-f".to_string(),
         "lavfi".to_string(),
@@ -149,8 +148,13 @@ mod tests {
 
     #[test]
     fn qsv_probe_exercises_nv12_scaling_and_the_render_overlay_graph_for_30_frames() {
-        for init_args in qsv_full_init_arg_candidates() {
-            let args = qsv_overlay_probe_args(&init_args);
+        for (index, candidate) in qsv_full_probe_candidates().iter().enumerate() {
+            let args = qsv_overlay_probe_args(candidate);
+            let init_args: Vec<_> = candidate
+                .init_args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect();
             assert!(args[3..].starts_with(&init_args));
             let graph = &args[args
                 .iter()
@@ -163,7 +167,9 @@ mod tests {
             );
             assert!(graph.contains("[main_hw][overlay_hw]overlay_qsv=x=0:y=0[out]"));
             assert!(!graph.contains("hwdownload"));
-            if cfg!(windows) {
+            if index == 0 {
+                assert!(graph.starts_with("[0:v]format=nv12,hwupload[probe_main];"));
+            } else {
                 assert!(graph.starts_with("[0:v]format=bgra,hwupload=extra_hw_frames=16,scale_qsv=format=nv12[probe_main];"));
             }
             assert!(args.windows(2).any(|pair| pair == ["-frames:v", "30"]));
@@ -174,35 +180,40 @@ mod tests {
     #[test]
     fn qsv_selection_stops_after_preferred_backend_succeeds() {
         let mut attempts = Vec::new();
-        let selected = select_qsv_full_init_args(|args| {
-            attempts.push(args.to_vec());
+        let selected = select_qsv_full_init_args(|candidate| {
+            attempts.push(
+                candidate
+                    .init_args
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            );
             true
         })
         .unwrap();
 
         assert_eq!(attempts, vec![selected.clone()]);
-        if cfg!(windows) {
-            assert_eq!(selected[1], "d3d11va=dx");
-            assert_eq!(selected[3], "qsv=qs@dx");
-            assert!(!selected.iter().any(|arg| arg == "qsv=qs"));
-        } else {
-            assert_eq!(selected[1], "qsv=qs");
-        }
+        assert_eq!(selected[1], "qsv=qs");
     }
 
     #[cfg(windows)]
     #[test]
-    fn qsv_selection_returns_dxva2_arguments_after_d3d11va_backend_fails() {
+    fn qsv_selection_returns_dxva2_arguments_after_default_backend_fails() {
         let mut attempts = Vec::new();
-        let selected = select_qsv_full_init_args(|args| {
-            attempts.push(args.to_vec());
-            args.iter().any(|arg| arg == "dxva2=dx")
+        let selected = select_qsv_full_init_args(|candidate| {
+            attempts.push(
+                candidate
+                    .init_args
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            );
+            attempts.len() == 2
         })
         .unwrap();
 
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0][1], "d3d11va=dx");
-        assert_eq!(attempts[0][3], "qsv=qs@dx");
+        assert_eq!(attempts[0][1], "qsv=qs");
         assert_eq!(attempts[1], selected);
         assert_eq!(selected[1], "dxva2=dx");
         assert_eq!(selected[3], "qsv=qs@dx");
