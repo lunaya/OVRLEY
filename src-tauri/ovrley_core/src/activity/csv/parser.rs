@@ -320,7 +320,7 @@ fn parse_header(index: usize, value: &str) -> Option<HeaderColumn> {
             Some(ControlKind::Percentage),
             None,
         ),
-        "accelerator position" | "accelerator pedal position" => (
+        "accelerator position" | "accelerator pedal position" | "pedal pos" => (
             Metric::ThrottlePosition,
             SourcePriority::Pedal,
             None,
