@@ -382,5 +382,50 @@ describe('MP4 activity — store actions', () => {
 
       expect(computeVideoSync).not.toHaveBeenCalled()
     })
+
+    test('correlates embedded video GPS speed against external activity speed regardless of timestamp rounding', () => {
+      const sampleCount = 801
+      const activityElapsed = Array.from({ length: sampleCount }, (_, i) => i * 0.25)
+      const trueOffset = 42.3
+      const speedSignal = (t) => 15 + 10 * Math.sin(t * 0.17) + 6 * Math.cos(t * 0.43)
+      const activitySpeed = activityElapsed.map((t) => speedSignal(t))
+
+      const videoSampleCount = 241
+      const videoElapsed = Array.from({ length: videoSampleCount }, (_, i) => i * 0.25)
+      const videoSpeed = videoElapsed.map((t) => speedSignal(t + trueOffset))
+
+      const videoActivity = {
+        ...mp4Telemetry,
+        metadata: { duration_seconds: 60, sample_count: videoSampleCount },
+        sample_elapsed_seconds: videoElapsed,
+        speed: videoSpeed,
+      }
+      const externalActivity = {
+        ...activityFile,
+        metadata: {
+          duration_seconds: 200,
+          end_time: '2026-11-07T18:27:20.000Z',
+          sample_count: sampleCount,
+          timezone: 'America/Los_Angeles',
+        },
+        sync_time: '2026-11-07T18:24:00.000Z',
+        sample_elapsed_seconds: activityElapsed,
+        speed: activitySpeed,
+      }
+
+      useStore.setState({
+        importedVideoPath: '/videos/DJI_0041.MP4',
+        importedVideoDuration: 60,
+        importedVideoCreationTime: '2026-11-07T18:25:00.000Z',
+        importedVideoTimeSource: 'gps',
+      })
+
+      useStore.getState().activateActivityFile(externalActivity)
+      expect(useStore.getState().videoSyncOffsetSeconds).toBe(60)
+
+      useStore.getState().loadVideoTelemetry(videoActivity)
+      expect(useStore.getState().videoSyncOffsetSeconds).toBeCloseTo(trueOffset, 1)
+      expect(useStore.getState().videoSyncWarning).toBeNull()
+    })
   })
 })

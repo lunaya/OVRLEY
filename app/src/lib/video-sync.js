@@ -1,6 +1,202 @@
 import i18next from 'i18next'
 import { getZonedDateTimeParts } from '@/lib/time-format'
 
+const CORRELATION_COARSE_STEP_SECONDS = 1
+const CORRELATION_FINE_STEP_SECONDS = 0.05
+const CORRELATION_FINE_WINDOW_SECONDS = 2
+const CORRELATION_MIN_OVERLAP_FLOOR_SECONDS = 10
+const CORRELATION_MIN_OVERLAP_CAP_SECONDS = 60
+const CORRELATION_MIN_SPEED_RANGE_MPS = 3
+const CORRELATION_MIN_SPEED_STD_MPS = 0.5
+const CORRELATION_MIN_SCORE = 0.85
+const CORRELATION_MAX_MEAN_ABS_ERROR_MPS = 3.5
+
+/**
+ * Extracts finite (time, speed) pairs and validates that the series has enough
+ * dynamic range to represent real movement rather than a stationary/cached fix.
+ *
+ * @param {object|null|undefined} activity Parsed activity object.
+ * @returns {{times: number[], speeds: number[], duration: number}|null} Validated speed profile, or null.
+ */
+function extractSpeedProfile(activity) {
+  const rawTimes = activity?.sample_elapsed_seconds
+  const rawSpeeds = activity?.speed
+  if (!Array.isArray(rawTimes) || !Array.isArray(rawSpeeds) || rawTimes.length < 2 || rawSpeeds.length !== rawTimes.length) {
+    return null
+  }
+
+  const times = []
+  const speeds = []
+  let minSpeed = Number.POSITIVE_INFINITY
+  let maxSpeed = Number.NEGATIVE_INFINITY
+  let sum = 0
+  let sumSq = 0
+
+  for (let index = 0; index < rawTimes.length; index += 1) {
+    const t = rawTimes[index]
+    const s = rawSpeeds[index]
+    if (typeof t !== 'number' || typeof s !== 'number' || !Number.isFinite(t) || !Number.isFinite(s)) continue
+    times.push(t)
+    speeds.push(s)
+    if (s < minSpeed) minSpeed = s
+    if (s > maxSpeed) maxSpeed = s
+    sum += s
+    sumSq += s * s
+  }
+
+  if (times.length < 2) return null
+  const duration = times[times.length - 1] - times[0]
+  if (duration < CORRELATION_MIN_OVERLAP_FLOOR_SECONDS) return null
+  if (maxSpeed - minSpeed < CORRELATION_MIN_SPEED_RANGE_MPS) return null
+
+  const mean = sum / speeds.length
+  const variance = Math.max(0, sumSq / speeds.length - mean * mean)
+  if (Math.sqrt(variance) < CORRELATION_MIN_SPEED_STD_MPS) return null
+
+  return { times, speeds, duration }
+}
+
+/**
+ * Resamples a irregularly or regularly spaced (times, speeds) profile onto a
+ * uniform grid starting at t = 0 with spacing `stepSeconds`.
+ *
+ * @param {{times: number[], speeds: number[]}} profile Validated speed profile.
+ * @param {number} stepSeconds Uniform sample interval in seconds.
+ * @returns {Float64Array} Uniformly sampled speed series.
+ */
+function resampleSpeedProfile(profile, stepSeconds) {
+  const { times, speeds } = profile
+  const endTime = times[times.length - 1]
+  const count = Math.floor(endTime / stepSeconds) + 1
+  const out = new Float64Array(count)
+  let cursor = 0
+
+  for (let index = 0; index < count; index += 1) {
+    const targetTime = index * stepSeconds
+    while (cursor + 1 < times.length && times[cursor + 1] < targetTime) {
+      cursor += 1
+    }
+    if (cursor + 1 < times.length && times[cursor + 1] > times[cursor]) {
+      const ratio = Math.min(1, Math.max(0, (targetTime - times[cursor]) / (times[cursor + 1] - times[cursor])))
+      out[index] = speeds[cursor] + ratio * (speeds[cursor + 1] - speeds[cursor])
+    } else {
+      out[index] = speeds[cursor]
+    }
+  }
+
+  return out
+}
+
+/**
+ * Evaluates Pearson correlation and mean absolute error at a discrete lag where
+ * `videoSeries[i]` aligns with `activitySeries[i + lag]`.
+ *
+ * @param {Float64Array} activitySeries Uniformly sampled activity speeds.
+ * @param {Float64Array} videoSeries Uniformly sampled video speeds.
+ * @param {number} lag Integer sample offset (`activityIndex - videoIndex`).
+ * @param {number} minOverlapSamples Minimum overlapping sample count required.
+ * @returns {{r: number, mae: number}|null} Correlation metrics, or null if invalid.
+ */
+function evaluateSpeedLag(activitySeries, videoSeries, lag, minOverlapSamples) {
+  const start = Math.max(0, -lag)
+  const end = Math.min(videoSeries.length, activitySeries.length - lag)
+  const count = end - start
+  if (count < minOverlapSamples) return null
+
+  let sumV = 0
+  let sumA = 0
+  let sumVV = 0
+  let sumAA = 0
+  let sumVA = 0
+  let sumAbsDiff = 0
+
+  for (let index = start; index < end; index += 1) {
+    const v = videoSeries[index]
+    const a = activitySeries[index + lag]
+    sumV += v
+    sumA += a
+    sumVV += v * v
+    sumAA += a * a
+    sumVA += v * a
+    sumAbsDiff += Math.abs(v - a)
+  }
+
+  const cov = sumVA - (sumV * sumA) / count
+  const varV = sumVV - (sumV * sumV) / count
+  const varA = sumAA - (sumA * sumA) / count
+  if (varV <= 1e-6 || varA <= 1e-6) return null
+
+  return {
+    r: cov / Math.sqrt(varV * varA),
+    mae: sumAbsDiff / count,
+  }
+}
+
+/**
+ * Aligns embedded video GPS speed telemetry against external activity speed
+ * telemetry using two-stage coarse-to-fine cross-correlation.
+ *
+ * @param {object|null|undefined} videoTelemetry Embedded video telemetry (`stashedVideoTelemetry`).
+ * @param {object|null|undefined} externalActivity External activity telemetry (`parsedActivity`).
+ * @returns {number|null} Best sync offset in seconds (rounded to 0.1s), or null when unavailable.
+ */
+export function correlateVideoTelemetryOffset(videoTelemetry, externalActivity) {
+  const videoProfile = extractSpeedProfile(videoTelemetry)
+  const activityProfile = extractSpeedProfile(externalActivity)
+  if (videoProfile === null || activityProfile === null) return null
+
+  const minOverlapSeconds = Math.max(
+    CORRELATION_MIN_OVERLAP_FLOOR_SECONDS,
+    Math.min(CORRELATION_MIN_OVERLAP_CAP_SECONDS, 0.5 * Math.min(videoProfile.duration, activityProfile.duration)),
+  )
+
+  const activityCoarse = resampleSpeedProfile(activityProfile, CORRELATION_COARSE_STEP_SECONDS)
+  const videoCoarse = resampleSpeedProfile(videoProfile, CORRELATION_COARSE_STEP_SECONDS)
+  const minCoarseSamples = Math.ceil(minOverlapSeconds / CORRELATION_COARSE_STEP_SECONDS)
+
+  const minCoarseLag = -videoCoarse.length + minCoarseSamples
+  const maxCoarseLag = activityCoarse.length - minCoarseSamples
+  if (minCoarseLag > maxCoarseLag) return null
+
+  let bestCoarseLag = null
+  let bestCoarseMetrics = null
+
+  for (let lag = minCoarseLag; lag <= maxCoarseLag; lag += 1) {
+    const metrics = evaluateSpeedLag(activityCoarse, videoCoarse, lag, minCoarseSamples)
+    if (metrics === null) continue
+    if (bestCoarseMetrics === null || metrics.r > bestCoarseMetrics.r) {
+      bestCoarseMetrics = metrics
+      bestCoarseLag = lag
+    }
+  }
+
+  if (bestCoarseLag === null || bestCoarseMetrics.r < CORRELATION_MIN_SCORE) return null
+
+  const activityFine = resampleSpeedProfile(activityProfile, CORRELATION_FINE_STEP_SECONDS)
+  const videoFine = resampleSpeedProfile(videoProfile, CORRELATION_FINE_STEP_SECONDS)
+  const minFineSamples = Math.ceil(minOverlapSeconds / CORRELATION_FINE_STEP_SECONDS)
+  const centerFineLag = Math.round((bestCoarseLag * CORRELATION_COARSE_STEP_SECONDS) / CORRELATION_FINE_STEP_SECONDS)
+  const fineRadius = Math.round(CORRELATION_FINE_WINDOW_SECONDS / CORRELATION_FINE_STEP_SECONDS)
+
+  let bestFineLag = centerFineLag
+  let bestFineMetrics = bestCoarseMetrics
+
+  for (let lag = centerFineLag - fineRadius; lag <= centerFineLag + fineRadius; lag += 1) {
+    const metrics = evaluateSpeedLag(activityFine, videoFine, lag, minFineSamples)
+    if (metrics === null) continue
+    if (metrics.r > bestFineMetrics.r) {
+      bestFineMetrics = metrics
+      bestFineLag = lag
+    }
+  }
+
+  if (bestFineMetrics.r < CORRELATION_MIN_SCORE || bestFineMetrics.mae > CORRELATION_MAX_MEAN_ABS_ERROR_MPS) {
+    return null
+  }
+
+  return Math.round(bestFineLag * CORRELATION_FINE_STEP_SECONDS * 10) / 10
+}
+
 /**
  * Reports whether a video interval overlaps the activity interval.
  *
@@ -104,6 +300,22 @@ export function resolveVideoSyncState(videoState, activitySummary) {
   const ambiguous = videoState.importedVideoTimeSource === 'ffprobe' || videoState.importedVideoTimeSource === 'filename'
   const inferMode = ambiguous && (videoState.videoSyncTimezoneMode === null || videoState.videoSyncTimezoneMode === undefined)
   const modes = inferMode ? ['local', 'utc'] : [mode]
+
+  const correlatedOffset =
+    activitySummary !== null &&
+    activitySummary !== undefined &&
+    videoState.importedVideoTimeSource !== 'filename' &&
+    videoState.parsedActivitySource === 'activity-file'
+      ? correlateVideoTelemetryOffset(videoState.stashedVideoTelemetry, videoState.parsedActivity)
+      : null
+  const correlatedOverlaps =
+    correlatedOffset !== null &&
+    videoOverlapsActivity({
+      videoStart: correlatedOffset,
+      videoDuration: videoState.importedVideoDuration,
+      activityEnd: activitySummary?.durationSeconds ?? Number.POSITIVE_INFINITY,
+    })
+
   try {
     const candidates = modes.map((timezoneMode) => {
       const { automaticOffsetSeconds, activityDurationSeconds } = calculateAutomaticVideoOffset(
@@ -124,13 +336,28 @@ export function resolveVideoSyncState(videoState, activitySummary) {
     const matches = candidates.filter(({ overlaps }) => overlaps)
     const selected = matches[0] ?? candidates[0]
     const inferredLocalOnly = inferMode && matches.length === 1 && selected.timezoneMode === 'local'
+    const timezoneMode = ambiguous && !inferredLocalOnly ? selected.timezoneMode : null
+    if (correlatedOverlaps) {
+      return {
+        videoSyncOffsetSeconds: correlatedOffset,
+        videoSyncWarning: null,
+        videoSyncTimezoneMode: timezoneMode,
+      }
+    }
     return {
       videoSyncOffsetSeconds: selected.overlaps ? selected.automaticOffsetSeconds : 0,
       videoSyncWarning: selected.overlaps ? null : i18next.t('store.videoCouldNotBeSyncedWithActivity', 'Video could not be synced with activity'),
-      videoSyncTimezoneMode: ambiguous && !inferredLocalOnly ? selected.timezoneMode : null,
+      videoSyncTimezoneMode: timezoneMode,
     }
   } catch (error) {
     if (!(error instanceof VideoSyncError)) throw error
+    if (correlatedOverlaps) {
+      return {
+        videoSyncOffsetSeconds: correlatedOffset,
+        videoSyncWarning: null,
+        videoSyncTimezoneMode: null,
+      }
+    }
     return {
       videoSyncOffsetSeconds: 0,
       videoSyncWarning: i18next.t(error.translationKey, error.message),
