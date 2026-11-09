@@ -224,6 +224,9 @@ export function createMediaSlice(set, get) {
         setActivityState(set, get, (state) => {
           state.stashedVideoTelemetry = activity
         })
+        if (get().importedVideoPath !== null && get().computeVideoSync) {
+          get().computeVideoSync(get().activitySummary)
+        }
       } else {
         get().clearVideoSyncForActivity()
         setActivityState(set, get, (state) => {
